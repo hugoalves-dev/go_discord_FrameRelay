@@ -12,10 +12,10 @@ document.querySelector('#run').onclick = async () => {
   result.textContent = 'Running'; MediaPlayer.checkAPIs();
   const context = new AudioContext({ sampleRate: 48000 }); await context.resume();
   const originalPush = AudioPlayback.prototype.push;
-  AudioPlayback.prototype.push = function(data, when) {
+  AudioPlayback.prototype.push = function(data) {
    const samples = new Float32Array(data.numberOfFrames); data.copyTo(samples, { planeIndex: 0, format: 'f32-planar' });
    energy += samples.reduce((total, value) => total + value * value, 0); audioFrames++;
-   return originalPush.call(this, data, when);
+   return originalPush.call(this, data);
   };
   const packets = []; const videoPackets = [];
   const videoConfig = { codec: 'avc1.42e01e', width: 64, height: 64, bitrate: 200000, framerate: 30, avc: { format: 'annexb' }, latencyMode: 'realtime' };

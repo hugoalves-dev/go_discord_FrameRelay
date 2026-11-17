@@ -28,40 +28,41 @@ export class MediaPlayer {
  private stopped = false;
  private baseUs: number | undefined;
  private baseSeconds = 0;
- private audioClock = false;
+ private lateFrames = 0;
+ private lastPresented: number | undefined;
  private lastRequest = -Infinity;
  private frames: { frame: VideoFrame; timer: ReturnType<typeof setTimeout> }[] = [];
  private firstVideoLogged = false;
  private firstDecodedLogged = false;
  private loggedKeyFrameGeneration = -1;
  private onDiagnostic: (level: 'info' | 'warn' | 'error', event: string, detail?: string) => void;
+ private onAudioState: (blocked: boolean) => void;
  constructor(canvas: HTMLCanvasElement, requestKey: () => void, onFrame = () => {}, onError = (_error: Error) => {},
-  onDiagnostic: (level: 'info' | 'warn' | 'error', event: string, detail?: string) => void = () => {}) {
-  this.canvas = canvas; this.requestKey = requestKey; this.onFrame = onFrame; this.onError = onError; this.onDiagnostic = onDiagnostic;
+  onDiagnostic: (level: 'info' | 'warn' | 'error', event: string, detail?: string) => void = () => {}, onAudioState = (_blocked: boolean) => {}) {
+  this.canvas = canvas; this.requestKey = requestKey; this.onFrame = onFrame; this.onError = onError; this.onDiagnostic = onDiagnostic; this.onAudioState = onAudioState;
  }
  static checkAPIs() {
   if (typeof VideoDecoder !== 'function' || typeof AudioDecoder !== 'function' || typeof EncodedVideoChunk !== 'function'
    || typeof EncodedAudioChunk !== 'function' || typeof AudioContext !== 'function')
    throw new Error('Discord does not expose the required WebCodecs APIs. Use the FrameRelay desktop viewer.');
  }
- private now() { return this.playback?.running ? this.playback.context.currentTime : performance.now() / 1000; }
+ // Video runs on its own clock; audio is scheduled independently by AudioPlayback's play cursor.
+ private now() { return performance.now() / 1000; }
  private time(timestamp: number) {
-  const audioClock = this.playback?.running ?? false;
-  if (this.baseUs === undefined || audioClock !== this.audioClock) {
-   this.baseUs = timestamp; this.baseSeconds = this.now() + 0.1; this.audioClock = audioClock;
-  }
+  if (this.baseUs === undefined) { this.baseUs = timestamp; this.baseSeconds = this.now() + 0.1; }
   return this.baseSeconds + (timestamp - this.baseUs) / 1000000;
  }
  private clearFrames(countAsDiscarded = false) {
   if (countAsDiscarded) this.discardedFrames += this.frames.length;
   for (const item of this.frames) { clearTimeout(item.timer); item.frame.close(); } this.frames = [];
  }
- private clearDecoders(countFramesAsDiscarded = false) {
+ private clearVideo(countFramesAsDiscarded = false) {
   this.clearFrames(countFramesAsDiscarded);
   if (this.video && this.video.state !== 'closed') this.video.close(); this.video = undefined;
-  if (this.audio && this.audio.state !== 'closed') this.audio.close(); this.audio = undefined;
-  this.playback?.reset(); this.baseUs = undefined;
+  this.baseUs = undefined; this.lateFrames = 0;
  }
+ private clearAudio() { if (this.audio && this.audio.state !== 'closed') this.audio.close(); this.audio = undefined; this.playback?.reset(); }
+ private clearDecoders() { this.clearVideo(); this.clearAudio(); }
  async accept(m: MediaMessage) {
   if (this.stopped || m.generation < this.generation) return;
   if (m.type === 1) this.configurations++;
@@ -85,6 +86,11 @@ export class MediaPlayer {
   if (m.sequence !== this.sequence + 1 && !this.waitKey) this.recover();
   this.sequence = m.sequence;
   if (m.type === 2) {
+   // Only video packets count: screen capture sends no video while the screen is unchanged.
+   const now = performance.now();
+   if (this.lastPresented !== undefined && now - this.lastPresented > 2000) {
+    this.lastPresented = now; this.onDiagnostic('warn', 'Video stalled', `no frame presented for 2 s while video packets arrive; generation ${this.generation}`); this.recover();
+   }
    if (!this.firstVideoLogged) { this.firstVideoLogged = true; this.onDiagnostic('info', 'First video packet received', `keyframe ${m.flags === 1 ? 'yes' : 'no'}`); }
    if (m.flags === 1 && this.loggedKeyFrameGeneration !== m.generation) {
     this.loggedKeyFrameGeneration = m.generation;
@@ -96,56 +102,68 @@ export class MediaPlayer {
    if (this.video.state !== 'configured') { this.recover(); return; }
    try { this.video.decode(new EncodedVideoChunk({ type: m.flags === 1 ? 'key' : 'delta', timestamp: m.timestampUs,
     duration: m.durationUs, data: m.payload.slice().buffer })); } catch (error) { this.recordDecoderError(error, 'H.264', 'decode() rejected chunk'); this.recover(); }
-  } else if (m.type === 3 && !this.waitKey && this.audio) {
+  } else if (m.type === 3 && this.audio) {
    if (this.audio.decodeQueueSize >= 32) { this.playback?.reset(); this.audio.reset();
     if (this.config.audio) this.audio.configure({ codec: 'opus', sampleRate: this.config.audio.sampleRate, numberOfChannels: this.config.audio.channels });
     return;
    }
    try { this.audio.decode(new EncodedAudioChunk({ type: 'key', timestamp: m.timestampUs, duration: m.durationUs, data: m.payload.slice().buffer })); }
-   catch (error) { this.recordDecoderError(error, 'Opus', 'decode() rejected packet'); this.recover(); }
+   catch (error) { this.recordDecoderError(error, 'Opus', 'decode() rejected packet'); this.resetAudio(); }
   }
  }
- private configureDecoders(config: MediaConfiguration, epoch: number) {
-  const videoConfig = { codec: config.video.codec, codedWidth: config.video.width, codedHeight: config.video.height, optimizeForLatency: true };
-  const audioConfig = config.audio ? { codec: 'opus', sampleRate: config.audio.sampleRate, numberOfChannels: config.audio.channels } : undefined;
+ private configureDecoders(config: MediaConfiguration, epoch: number) { this.configureVideo(config, epoch); this.configureAudio(config, epoch); }
+ // Callbacks also check decoder identity, so replacing one track's decoder never affects the other track.
+ private configureVideo(config: MediaConfiguration, epoch: number) {
   this.canvas.width = config.video.width; this.canvas.height = config.video.height;
-   this.video = new VideoDecoder({ output: frame => {
-    if (epoch !== this.epoch || this.stopped) { frame.close(); return; }
-    this.decodedFrames++; this.display(frame);
-    if (!this.firstDecodedLogged) { this.firstDecodedLogged = true; this.onDiagnostic('info', 'First H.264 frame decoded'); }
-   }, error: error => { if (epoch === this.epoch) { this.recordDecoderError(error, 'H.264', 'decoder callback failed'); this.recover(); } } });
-   this.video.configure(videoConfig);
-   if (audioConfig) {
-    this.playback ??= new AudioPlayback();
-    this.playback.setVolume(this.volume);
-    this.audio = new AudioDecoder({ output: data => {
-     if (epoch !== this.epoch || this.stopped) { data.close(); return; }
-     try { this.playback!.push(data, this.time(data.timestamp)); } catch (error) { this.onError(error as Error); }
-    }, error: error => { if (epoch === this.epoch) { this.recordDecoderError(error, 'Opus', 'decoder callback failed'); this.recover(); } } });
-    this.audio.configure(audioConfig);
-   }
-   else { this.playback?.close(); this.playback = undefined; }
+  const video: VideoDecoder = this.video = new VideoDecoder({ output: frame => {
+   if (epoch !== this.epoch || this.stopped || video !== this.video) { frame.close(); return; }
+   this.decodedFrames++; this.display(frame);
+   if (!this.firstDecodedLogged) { this.firstDecodedLogged = true; this.onDiagnostic('info', 'First H.264 frame decoded'); }
+  }, error: error => { if (epoch === this.epoch && video === this.video) { this.recordDecoderError(error, 'H.264', 'decoder callback failed'); this.recover(); } } });
+  video.configure({ codec: config.video.codec, codedWidth: config.video.width, codedHeight: config.video.height, optimizeForLatency: true });
+ }
+ private configureAudio(config: MediaConfiguration, epoch: number) {
+  if (!config.audio) { this.playback?.close(); this.playback = undefined; return; }
+  this.playback ??= new AudioPlayback(() => this.onAudioState(this.audioBlocked));
+  this.playback.setVolume(this.volume);
+  const audio: AudioDecoder = this.audio = new AudioDecoder({ output: data => {
+   if (epoch !== this.epoch || this.stopped || audio !== this.audio) { data.close(); return; }
+   try { this.playback!.push(data); } catch (error) { this.onError(error as Error); }
+  }, error: error => { if (epoch === this.epoch && audio === this.audio) { this.recordDecoderError(error, 'Opus', 'decoder callback failed'); this.resetAudio(); } } });
+  audio.configure({ codec: 'opus', sampleRate: config.audio.sampleRate, numberOfChannels: config.audio.channels });
+  this.onAudioState(this.audioBlocked);
+ }
+ private resetAudio() {
+  if (this.stopped || !this.config) return;
+  this.clearAudio(); try { this.configureAudio(this.config, this.epoch); } catch (error) { this.onError(error as Error); }
  }
  private display(frame: VideoFrame) {
-  const when = this.time(frame.timestamp); const delay = when - this.now();
+  let delay = this.time(frame.timestamp) - this.now();
+  // Persistent lateness (clock drift, network backlog) would otherwise discard every later frame forever.
+  if (delay < -0.15 && ++this.lateFrames >= 3) {
+   this.onDiagnostic('warn', 'Video timeline re-anchored', `frames late by ${Math.round(-delay * 1000)} ms`);
+   this.baseUs = undefined; delay = this.time(frame.timestamp) - this.now();
+  }
   if (delay < -0.15 || delay > 0.5 || this.frames.length >= 8) {
    this.discardedFrames++; frame.close();
    if (this.discardedFrames === 1) this.onDiagnostic('warn', 'Decoded frame discarded', delay < -0.15 ? 'late' : delay > 0.5 ? 'too early' : 'playback queue full');
    if (delay > 0.5) this.recover(); return;
   }
+  this.lateFrames = 0;
   const item = { frame, timer: setTimeout(() => {
    this.frames = this.frames.filter(x => x !== item);
-   try { if (!this.stopped && this.time(frame.timestamp) - this.now() >= -0.15) { this.canvas.getContext('2d')!.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height); this.onFrame(); } else this.discardedFrames++; }
+   try { if (!this.stopped && this.time(frame.timestamp) - this.now() >= -0.15) { this.canvas.getContext('2d')!.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height); this.lastPresented = performance.now(); this.onFrame(); } else this.discardedFrames++; }
    finally { frame.close(); }
   }, Math.max(0, delay * 1000)) };
   this.frames.push(item);
  }
  recover() {
   if (this.stopped) return;
+  // Video-only recovery: audio keeps decoding and playing while video waits for the next keyframe.
   this.waitKey = true;
   if (this.config) {
-   const epoch = ++this.epoch; this.clearDecoders(true);
-   try { this.configureDecoders(this.config, epoch); } catch (error) { this.onError(error as Error); }
+   this.clearVideo(true);
+   try { this.configureVideo(this.config, this.epoch); } catch (error) { this.onError(error as Error); }
   }
   if (performance.now() - this.lastRequest >= 1000) { this.lastRequest = performance.now(); this.requestKey(); }
  }
@@ -165,7 +183,7 @@ export class MediaPlayer {
   if (!this.decodedFrames) return `Media received ${this.videoPackets} video packets and ${this.audioPackets} audio packets, but H.264 decoding produced no frames.${failure}`;
   return `Media decoded ${this.decodedFrames} frames but playback did not render them (discarded ${this.discardedFrames}).${failure}`;
  }
- async resumeAudio() { await this.playback?.resume(); this.baseUs = undefined; }
+ async resumeAudio() { await this.playback?.resume(); }
  setVolume(volume: number) {
   this.volume = Number.isFinite(volume) ? Math.min(1, Math.max(0, volume)) : this.volume;
   this.playback?.setVolume(this.volume);
