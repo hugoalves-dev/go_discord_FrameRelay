@@ -94,3 +94,78 @@ test('distinguishes synchronous decode rejection from decoder callback failure',
  assert.match(detail, /DataError: decoder rejected access unit/);
  assert.doesNotMatch(detail, /private-token/); p.stop();
 });
+
+// Audio-enabled and timing fakes.
+const audioConfig = { ...config, audio: { codec: 'opus', sampleRate: 48000, channels: 2 } };
+let audioOutputs, audioDecoders, audioDecoded;
+class AudioDecoderFake extends Decoder {
+ constructor(callbacks) { super({}); outputs = videoOutputs; audioOutputs = callbacks; audioDecoders.push(this); }
+ decode(c) { audioDecoded.push(c); }
+}
+let videoOutputs; const VideoDecoderFake = class extends Decoder { constructor(callbacks) { super(callbacks); videoOutputs = callbacks; } };
+globalThis.VideoDecoder = VideoDecoderFake;
+globalThis.AudioDecoder = AudioDecoderFake;
+globalThis.EncodedAudioChunk = class { constructor(init) { Object.assign(this, init); } };
+globalThis.AudioContext = class {
+ constructor() { this.state = 'running'; this.currentTime = 0; this.destination = {}; this.listeners = new Set(); }
+ createGain() { return { gain: { setTargetAtTime() {} }, connect() {}, disconnect() {} }; }
+ createBuffer(_c, frames, rate) { return { duration: frames / rate, copyToChannel() {} }; }
+ createBufferSource() { return { connect() {}, disconnect() {}, start() {}, stop() {} }; }
+ addEventListener(_t, l) { this.listeners.add(l); } removeEventListener(_t, l) { this.listeners.delete(l); }
+ async resume() { this.state = 'running'; this.listeners.forEach(l => l()); } async close() { this.state = 'closed'; }
+ async suspend() { this.state = 'suspended'; this.listeners.forEach(l => l()); }
+};
+const realNow = performance.now.bind(performance); let clock = 0;
+function timed(t) { clock = 0; performance.now = () => clock; t.mock.timers.enable({ apis: ['setTimeout'] }); t.after(() => { performance.now = realNow; }); }
+function richPlayer() {
+ decoded = []; closed = requests = 0; supported = true; throwDecode = undefined; audioDecoders = []; audioDecoded = [];
+ const log = { frames: 0, diagnostics: [], audioStates: [] };
+ const p = new MediaPlayer(canvas, () => requests++, () => log.frames++, () => {}, (...entry) => log.diagnostics.push(entry), blocked => log.audioStates.push(blocked));
+ return Object.assign(p, { log });
+}
+const configMessage = (cfg, sequence = 0) => ({ ...message(1, sequence), payload: new TextEncoder().encode(JSON.stringify(cfg)) });
+const audioFrame = timestamp => ({ timestamp, numberOfFrames: 960, numberOfChannels: 2, sampleRate: 48000, copyTo() {}, close() {} });
+
+test('video recovery keeps the audio decoder and audio packets flowing', async () => {
+ const p = richPlayer(); await p.accept(configMessage(audioConfig));
+ await p.accept(message(3, 1)); assert.equal(audioDecoded.length, 1, 'audio before first keyframe is decoded');
+ await p.accept(message(2, 2, 1)); await p.accept(message(3, 3));
+ await p.accept(message(3, 6)); assert.equal(requests, 1, 'sequence gap requests a keyframe');
+ await p.accept(message(3, 7)); p.video.decodeQueueSize = 8; await p.accept(message(2, 8));
+ assert.equal(audioDecoded.length, 4); assert.equal(audioDecoders.length, 1); assert.notEqual(audioDecoders[0].state, 'closed');
+ let released = 0; audioOutputs.output({ ...audioFrame(0), close() { released++; } }); assert.equal(released, 1);
+ p.stop(); assert.equal(audioDecoders[0].state, 'closed');
+});
+test('opus decoder error resets audio only', async () => {
+ const p = richPlayer(); await p.accept(configMessage(audioConfig)); await p.accept(message(2, 1, 1));
+ const video = p.video; audioOutputs.error(new DOMException('bad packet', 'EncodingError'));
+ assert.equal(p.video, video); assert.equal(audioDecoders.length, 2); await p.accept(message(3, 2)); assert.equal(audioDecoded.length, 1); p.stop();
+});
+test('persistently late video re-anchors the timeline instead of freezing', async t => {
+ timed(t); const p = richPlayer(); await p.accept(message(1, 0)); await p.accept(message(2, 1, 1));
+ videoOutputs.output({ timestamp: 0, close() {} }); t.mock.timers.tick(200); assert.equal(p.log.frames, 1);
+ clock = 10000; for (let i = 1; i <= 6; i++) videoOutputs.output({ timestamp: i * 33333, close() {} });
+ t.mock.timers.tick(1000); assert.ok(p.log.frames >= 3, `presented ${p.log.frames}`);
+ assert.ok(p.log.diagnostics.some(([, event]) => event === 'Video timeline re-anchored')); p.stop();
+});
+test('stall watchdog requests recovery when packets arrive but nothing is presented', async t => {
+ timed(t); const p = richPlayer(); await p.accept(message(1, 0)); await p.accept(message(2, 1, 1));
+ videoOutputs.output({ timestamp: 0, close() {} }); t.mock.timers.tick(200);
+ clock = 1500; await p.accept(message(2, 2)); assert.equal(requests, 0);
+ clock = 2500; await p.accept(message(2, 3)); assert.equal(requests, 1);
+ assert.ok(p.log.diagnostics.some(([level, event]) => level === 'warn' && event === 'Video stalled'));
+ clock = 2600; await p.accept(message(2, 4)); assert.equal(requests, 1, 'watchdog backs off'); p.stop();
+});
+test('static screen with only audio packets does not trip the stall watchdog', async t => {
+ timed(t); const p = richPlayer(); await p.accept(configMessage(audioConfig)); await p.accept(message(2, 1, 1));
+ videoOutputs.output({ timestamp: 0, close() {} }); t.mock.timers.tick(200);
+ clock = 2500; await p.accept(message(3, 2)); clock = 5000; await p.accept(message(3, 3));
+ assert.equal(requests, 0, 'capture sends no video while the screen is unchanged');
+ assert.ok(!p.log.diagnostics.some(([, event]) => event === 'Video stalled')); p.stop();
+});
+test('reports audio blocked state on configuration and on context state changes', async () => {
+ const p = richPlayer(); await p.accept(configMessage(audioConfig)); assert.deepEqual(p.log.audioStates, [false]);
+ const context = p.playback.context; await context.suspend(); assert.deepEqual(p.log.audioStates, [false, true]);
+ await p.resumeAudio(); assert.deepEqual(p.log.audioStates, [false, true, false]);
+ p.stop(); await context.suspend(); assert.equal(p.log.audioStates.length, 3, 'stopped player stops listening');
+});

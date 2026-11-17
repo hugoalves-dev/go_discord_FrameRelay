@@ -90,6 +90,7 @@ async function stop() {
  await old?.close();
 }
 function fail(message: string) { writeLog('error', 'Activity playback failed', safeErrorSummary(message)); void stop(); status.textContent = message; connect.disabled = false; }
+function failAndRetry(message: string) { fail(message); retry = setTimeout(() => void start(), retryDelay); retryDelay = Math.min(30000, retryDelay * 2); }
 async function start() {
  await stop(); connect.disabled = true; const current = generation;
  const controller = cancel = new AbortController(); let stage = 'WebCodecs capability check';
@@ -115,15 +116,12 @@ async function start() {
    if (current !== generation) return;
    if (status.textContent !== 'Watching') writeLog('info', 'First video frame presented');
    status.textContent = 'Watching'; clearTimeout(timeout); retryDelay = 1000; play.hidden = !view.audioBlocked;
-  }, error => { if (current === generation) fail(safeErrorSummary(error)); },
-  (level, event, detail) => writeLog(level, event, detail));
+  }, error => { if (current === generation) failAndRetry(safeErrorSummary(error)); },
+  (level, event, detail) => writeLog(level, event, detail), blocked => { if (current === generation) play.hidden = !blocked; });
   view.setVolume(muted ? 0 : volumeLevel);
  media = client = new MediaClient(release, error => {
    if (current !== generation) return;
-   fail(error.message);
-   if (error instanceof MediaDisconnectedError) {
-    retry = setTimeout(() => void start(), retryDelay); retryDelay = Math.min(30000, retryDelay * 2);
-   }
+   if (error instanceof MediaDisconnectedError) failAndRetry(error.message); else fail(error.message);
   }, (level, event, detail) => writeLog(level, event, detail));
   stage = 'media WebSocket';
   await media.connect(admission, view, controller.signal);
