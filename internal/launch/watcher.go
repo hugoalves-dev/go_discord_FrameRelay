@@ -2,7 +2,6 @@ package launch
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -20,47 +19,21 @@ type Publisher interface {
 	PublishReady(context.Context, relaycontrol.PendingIntent, relaycontrol.IntentStatus) (string, error)
 }
 
+// Watcher publishes ready, unpublished launch intents and acknowledges them. It is driven by
+// EventLoop; PollOnce is idempotent because acknowledged intents leave GET /pending.
 type Watcher struct {
 	backend   Backend
 	publisher Publisher
-	interval  time.Duration
 	now       func() time.Time
 	logger    *slog.Logger
 	cacheMu   sync.Mutex
 	ready     map[string]relaycontrol.IntentStatus
 }
 
-func NewWatcher(backend Backend, publisher Publisher, interval, _ time.Duration, logger *slog.Logger) *Watcher {
+func NewWatcher(backend Backend, publisher Publisher, logger *slog.Logger) *Watcher {
 	return &Watcher{
-		backend: backend, publisher: publisher, interval: interval,
+		backend: backend, publisher: publisher,
 		now: time.Now, logger: logger, ready: make(map[string]relaycontrol.IntentStatus),
-	}
-}
-
-func (w *Watcher) Run(ctx context.Context) error {
-	if w.interval <= 0 {
-		return fmt.Errorf("intent watcher interval must be positive")
-	}
-	if err := w.PollOnce(ctx); err != nil && ctx.Err() == nil {
-		w.logRetry("intent_poll")
-	}
-	ticker := time.NewTicker(w.interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if err := w.PollOnce(ctx); err != nil && ctx.Err() == nil {
-				w.logRetry("intent_poll")
-			}
-		}
-	}
-}
-
-func (w *Watcher) logRetry(operation string) {
-	if w.logger != nil {
-		w.logger.Warn("launch recovery will retry", "operation", operation)
 	}
 }
 

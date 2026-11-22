@@ -66,10 +66,11 @@ func run(cfg config.Config, logger *slog.Logger) error {
 	}()
 	go syncCommands(ctx, client, cfg.ApplicationID, cfg.GuildID, logger)
 
-	watcher := launch.NewWatcher(backend, adapter, cfg.IntentPollInterval, cfg.WatchIntentTTL, logger)
+	watcher := launch.NewWatcher(backend, adapter, logger)
+	events := launch.NewEventLoop(backend, watcher, cfg.IntentFallbackInterval, readiness.SetRelayControl, logger)
 	watcherErrors := make(chan error, 1)
-	go func() { watcherErrors <- watcher.Run(ctx) }()
-	go monitorReadiness(ctx, client, backend, readiness, cfg.IntentPollInterval)
+	go func() { watcherErrors <- events.Run(ctx) }()
+	go monitorDiscordReadiness(ctx, client, readiness)
 
 	logger.Info("FrameRelay bot started", "operation", "startup")
 	select {
@@ -116,15 +117,15 @@ func syncCommands(ctx context.Context, client *bot.Client, applicationID, guildI
 	}
 }
 
-func monitorReadiness(ctx context.Context, client *bot.Client, backend *relaycontrol.Client, readiness *health.Readiness, interval time.Duration) {
-	ticker := time.NewTicker(interval)
+// discordReadinessInterval only reads local gateway state; RelayControl readiness is reported
+// by the launch event stream, so no backend request is made for health.
+const discordReadinessInterval = 5 * time.Second
+
+func monitorDiscordReadiness(ctx context.Context, client *bot.Client, readiness *health.Readiness) {
+	ticker := time.NewTicker(discordReadinessInterval)
 	defer ticker.Stop()
 	probe := func() {
 		readiness.SetDiscord(client.Gateway != nil && client.Gateway.Status().IsConnected())
-		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		_, err := backend.ListPending(probeCtx)
-		readiness.SetRelayControl(err == nil)
 	}
 	probe()
 	for {
