@@ -70,7 +70,22 @@ func (a *Adapter) OnCommand(event *events.ApplicationCommandInteractionCreate) {
 	}
 	if _, err := a.client.Rest.UpdateInteractionResponse(event.ApplicationID(), event.Token(), message, rest.WithCtx(ctx)); err != nil {
 		a.logger.Warn("discord interaction response failed", "operation", "update_interaction")
+		return
 	}
+	if response.Announcement != nil {
+		// An interaction follow-up is the Discord-supported way for a user-installed app
+		// to post in a DM or Group DM it is not a member of.
+		if _, err := a.client.Rest.CreateFollowupMessage(event.ApplicationID(), event.Token(), privateAnnouncementMessage(*response.Announcement), rest.WithCtx(ctx)); err != nil {
+			a.logger.Warn("discord private share announcement failed", "operation", "private_announcement")
+		}
+	}
+}
+
+func privateAnnouncementMessage(announcement Announcement) discord.MessageCreate {
+	return discord.NewMessageCreate().
+		WithContent(announcement.Content).
+		WithAllowedMentions(&discord.AllowedMentions{Parse: []discord.AllowedMentionType{}}).
+		AddActionRow(discord.NewPrimaryButton("Watch in FrameRelay", "framerelay:watch:"+announcement.ReadyIntentID))
 }
 
 var readyIntentPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
@@ -124,6 +139,11 @@ func (a *Adapter) OnComponent(event *events.ComponentInteractionCreate) {
 }
 
 func (a *Adapter) PublishReady(ctx context.Context, intent relaycontrol.PendingIntent, _ relaycontrol.IntentStatus) (string, error) {
+	if intent.GuildID == "" {
+		// DMs and Group DMs were announced by the share command's follow-up; the bot
+		// cannot post there itself, so mark the intent published without a message.
+		return "", nil
+	}
 	channelNumber, err := strconv.ParseUint(intent.ChannelID, 10, 64)
 	if err != nil {
 		return "", fmt.Errorf("pending intent channel id is invalid")

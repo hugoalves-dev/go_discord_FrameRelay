@@ -31,11 +31,25 @@ type LinkButton struct {
 	URL   string
 }
 
-type Response struct {
-	Content   string
-	Ephemeral bool
-	Button    *LinkButton
+// Announcement is a public follow-up in a DM or Group DM. The bot is usually not a
+// member there, so it cannot post the ready message later; recipients use this
+// button to request their own watch link once the share is live.
+type Announcement struct {
+	Content       string
+	ReadyIntentID string
 }
+
+type Response struct {
+	Content      string
+	Ephemeral    bool
+	Button       *LinkButton
+	Announcement *Announcement
+}
+
+const privateActivityNotice = "Discord Activities are not available in this conversation, so FrameRelay opens in the desktop viewer."
+
+// isPrivate reports a DM, Group DM, or bot DM. Discord sends no guild there.
+func (i Interaction) isPrivate() bool { return i.GuildID == "" }
 
 type CommandHandler struct {
 	backend  Backend
@@ -62,7 +76,7 @@ type ReadyWatchBackend interface {
 
 func (h *CommandHandler) HandleReadyFallback(ctx context.Context, interaction Interaction) Response {
 	backend, ok := h.backend.(ReadyWatchBackend)
-	if !ok || interaction.ReadyIntentID == "" || interaction.GuildID == "" || interaction.ChannelID == "" {
+	if !ok || interaction.ReadyIntentID == "" || interaction.ChannelID == "" {
 		return Response{Content: "Run `/framerelay watch code:<host-code>` for a personal desktop watch link.", Ephemeral: true}
 	}
 	watch, err := backend.CreateWatchFromReady(ctx, interaction.ReadyIntentID, relaycontrol.CreateReadyActivityRequest{
@@ -70,16 +84,21 @@ func (h *CommandHandler) HandleReadyFallback(ctx context.Context, interaction In
 		RequestedByUserID: interaction.UserID, TTLSeconds: int(h.watchTTL.Seconds()),
 	})
 	if err != nil || watch.LaunchURL == "" {
-		return Response{Content: "This share is unavailable. Run `/framerelay watch code:<host-code>` to try again.", Ephemeral: true}
+		return Response{Content: "This share is not live yet or has ended. Try again once the host is sharing, or run `/framerelay watch code:<host-code>`.", Ephemeral: true}
 	}
-	return Response{Content: "Discord viewing is unavailable. Open your personal FrameRelay desktop link instead.", Ephemeral: true,
+	content := "Discord viewing is unavailable. Open your personal FrameRelay desktop link instead."
+	if interaction.isPrivate() {
+		content = privateActivityNotice + " Open your personal link instead."
+	}
+	return Response{Content: content, Ephemeral: true,
 		Button: &LinkButton{Label: "Watch in FrameRelay", URL: watch.LaunchURL}}
 }
 
 // InitialResponse creates the intent before callback 12. When setup is unavailable,
 // it defers instead; the caller then runs Handle for the existing desktop link.
 func (h *CommandHandler) InitialResponse(ctx context.Context, interaction Interaction, respond func(context.Context, bool) error) (bool, error) {
-	if (interaction.Subcommand == "watch" || interaction.ReadyIntentID != "") && interaction.GuildID != "" && interaction.ChannelID != "" {
+	// Activities are only offered in guilds: the RelayControl Activity flow is guild-bound.
+	if (interaction.Subcommand == "watch" || interaction.ReadyIntentID != "") && !interaction.isPrivate() && interaction.ChannelID != "" {
 		_, codeSupported := h.backend.(ActivityBackend)
 		_, readySupported := h.backend.(ReadyActivityBackend)
 		if (interaction.ReadyIntentID != "" && readySupported) || (interaction.ReadyIntentID == "" && codeSupported) {
@@ -138,19 +157,32 @@ func (h *CommandHandler) Handle(ctx context.Context, interaction Interaction) Re
 		if err != nil {
 			return Response{Content: userError(err), Ephemeral: true}
 		}
-		return Response{
+		response := Response{
 			Content: fmt.Sprintf("Ready to start FrameRelay.\nThis launch link expires at %s.",
 				intent.ExpiresAt.UTC().Format(time.RFC3339)),
 			Ephemeral: true,
 			Button:    &LinkButton{Label: "Open FrameRelay and share", URL: intent.LaunchURL},
 		}
+		if interaction.isPrivate() {
+			response.Content += "\nPeople in this conversation can select **Watch in FrameRelay** on the announcement once you are sharing."
+			response.Announcement = &Announcement{
+				Content: fmt.Sprintf("<@%s> is starting a FrameRelay screen share. Once it is live, select **Watch in FrameRelay** for your personal desktop link. %s",
+					interaction.UserID, privateActivityNotice),
+				ReadyIntentID: intent.ID,
+			}
+		}
+		return response
 	case "watch":
 		watch, err := h.backend.CreateWatch(ctx, interaction.Code, int(h.watchTTL.Seconds()))
 		if err != nil {
 			return Response{Content: userError(err), Ephemeral: true}
 		}
+		content := fmt.Sprintf("Open this FrameRelay share before %s.", watch.ExpiresAt.UTC().Format(time.RFC3339))
+		if interaction.isPrivate() {
+			content = privateActivityNotice + " " + content
+		}
 		return Response{
-			Content:   fmt.Sprintf("Open this FrameRelay share before %s.", watch.ExpiresAt.UTC().Format(time.RFC3339)),
+			Content:   content,
 			Ephemeral: true,
 			Button:    &LinkButton{Label: "Watch in FrameRelay", URL: watch.LaunchURL},
 		}
