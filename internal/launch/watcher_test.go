@@ -15,7 +15,7 @@ func TestPollPublishesReadySessionAndAcknowledgesIt(t *testing.T) {
 		status:  relaycontrol.IntentStatus{ID: "intent-1", Status: "session_ready"},
 	}
 	publisher := &fakePublisher{}
-	watcher := NewWatcher(backend, publisher, time.Second, 30*time.Minute, nil)
+	watcher := NewWatcher(backend, publisher, nil)
 
 	if err := watcher.PollOnce(context.Background()); err != nil {
 		t.Fatal(err)
@@ -37,7 +37,7 @@ func TestPollCachesReadinessWithoutCapabilityWhileDiscordPublicationRetries(t *t
 		},
 	}
 	publisher := &fakePublisher{errors: []error{errors.New("discord unavailable"), nil}}
-	watcher := NewWatcher(backend, publisher, time.Second, 30*time.Minute, nil)
+	watcher := NewWatcher(backend, publisher, nil)
 
 	if err := watcher.PollOnce(context.Background()); err == nil {
 		t.Fatal("expected first publish attempt to fail")
@@ -56,7 +56,7 @@ func TestPollCachesReadinessWithoutCapabilityWhileDiscordPublicationRetries(t *t
 func TestPollRetriesPublicationWhenMarkPublishedFailsWithoutMintingCapability(t *testing.T) {
 	backend := &fakeBackend{intents: []relaycontrol.PendingIntent{{ID: "intent-1", Status: "session_ready"}}, status: relaycontrol.IntentStatus{ID: "intent-1", Status: "session_ready", ExpiresAt: time.Now().Add(time.Hour)}, markErrors: []error{errors.New("ack unavailable"), nil}}
 	publisher := &fakePublisher{}
-	watcher := NewWatcher(backend, publisher, time.Second, time.Minute, nil)
+	watcher := NewWatcher(backend, publisher, nil)
 	if err := watcher.PollOnce(context.Background()); err == nil {
 		t.Fatal("expected first acknowledgement to fail")
 	}

@@ -20,7 +20,9 @@ type Config struct {
 	LogLevel            slog.Level
 	ShareIntentTTL      time.Duration
 	WatchIntentTTL      time.Duration
-	IntentPollInterval  time.Duration
+	// IntentFallbackInterval is the low-frequency reconcile cadence used only while the
+	// RelayControl backend does not support the launch event stream (HTTP 404).
+	IntentFallbackInterval time.Duration
 }
 
 func Load(getenv func(string) string) (Config, error) {
@@ -28,16 +30,16 @@ func Load(getenv func(string) string) (Config, error) {
 		return Config{}, fmt.Errorf("configuration source is required")
 	}
 	cfg := Config{
-		DiscordToken:        strings.TrimSpace(getenv("DISCORD_TOKEN")),
-		ApplicationID:       strings.TrimSpace(getenv("DISCORD_APPLICATION_ID")),
-		GuildID:             strings.TrimSpace(getenv("DISCORD_GUILD_ID")),
-		RelayControlBaseURL: strings.TrimRight(strings.TrimSpace(getenv("RELAYCONTROL_BASE_URL")), "/"),
-		RelayControlToken:   strings.TrimSpace(getenv("RELAYCONTROL_SERVICE_TOKEN")),
-		HTTPAddress:         valueOr(getenv("HTTP_ADDR"), ":8080"),
-		LogLevel:            slog.LevelInfo,
-		ShareIntentTTL:      10 * time.Minute,
-		WatchIntentTTL:      30 * time.Minute,
-		IntentPollInterval:  2 * time.Second,
+		DiscordToken:           strings.TrimSpace(getenv("DISCORD_TOKEN")),
+		ApplicationID:          strings.TrimSpace(getenv("DISCORD_APPLICATION_ID")),
+		GuildID:                strings.TrimSpace(getenv("DISCORD_GUILD_ID")),
+		RelayControlBaseURL:    strings.TrimRight(strings.TrimSpace(getenv("RELAYCONTROL_BASE_URL")), "/"),
+		RelayControlToken:      strings.TrimSpace(getenv("RELAYCONTROL_SERVICE_TOKEN")),
+		HTTPAddress:            valueOr(getenv("HTTP_ADDR"), ":8080"),
+		LogLevel:               slog.LevelInfo,
+		ShareIntentTTL:         10 * time.Minute,
+		WatchIntentTTL:         30 * time.Minute,
+		IntentFallbackInterval: time.Minute,
 	}
 
 	var missing []string
@@ -75,12 +77,13 @@ func Load(getenv func(string) string) (Config, error) {
 		}
 		cfg.WatchIntentTTL = duration
 	}
-	if value := strings.TrimSpace(getenv("INTENT_POLL_INTERVAL")); value != "" {
+	// INTENT_POLL_INTERVAL is no longer read: steady state is event driven.
+	if value := strings.TrimSpace(getenv("INTENT_FALLBACK_INTERVAL")); value != "" {
 		duration, err := time.ParseDuration(value)
-		if err != nil || duration < 250*time.Millisecond || duration > time.Minute {
-			return Config{}, fmt.Errorf("INTENT_POLL_INTERVAL must be between 250ms and 1m")
+		if err != nil || duration < 15*time.Second || duration > time.Hour {
+			return Config{}, fmt.Errorf("INTENT_FALLBACK_INTERVAL must be between 15s and 1h")
 		}
-		cfg.IntentPollInterval = duration
+		cfg.IntentFallbackInterval = duration
 	}
 	if value := strings.TrimSpace(getenv("LOG_LEVEL")); value != "" {
 		level, err := parseLevel(value)

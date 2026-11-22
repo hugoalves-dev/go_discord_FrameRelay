@@ -21,6 +21,20 @@ The bot is usually not a member of private conversations, so it never posts the 
 ### Recovery
 
 The bot also recovers ready-but-unpublished shares after restart. It polls status with `watchTtlSeconds=0`, caches readiness without minting a watch capability, and uses a stable Discord message nonce so a retry after a successful post does not duplicate the announcement. The public announcement includes **Assistir no Discord**. Each click asks RelayControl for an Activity intent bound to that participant, guild, and channel. If the launch is unavailable, the bot replies privately with a fresh personal desktop watch link. The announcement contains no shared watch credential. `/framerelay watch` remains available with the host's code.
+The bot also recovers ready-but-unpublished shares after restart. It checks status with `watchTtlSeconds=0`, caches readiness without minting a watch capability, and uses a stable Discord message nonce so a retry after a successful post does not duplicate the announcement. The public announcement includes **Assistir no Discord**. Each click asks RelayControl for an Activity intent bound to that participant, guild, and channel. If the launch is unavailable, the bot replies privately with a fresh personal desktop watch link. The announcement contains no shared watch credential. `/framerelay watch` remains available with the host's code.
+
+## Launch events
+
+The bot learns about ready shares from RelayControl's authenticated server-sent event stream, `GET /api/launch-intents/events`, instead of polling. On every connection it waits for the `connected` frame, then reconciles `GET /api/launch-intents/pending` once. Shares that became ready while it was disconnected or restarting are published then. Each `session_ready` event (`{"intentId"}` only) triggers the same reconciliation, which publishes through the existing Discord flow and acknowledges with `POST /api/launch-intents/{id}/published`.
+
+- Duplicate events are harmless: acknowledged intents leave `/pending`, and the stable message nonce deduplicates a retried post. Delivery is at-least-once. If the bot crashes after posting but before the acknowledgement, the next reconciliation retries the post and Discord's nonce usually, but not always, suppresses the duplicate.
+- Failed publications (Discord or API unavailable) are retried with exponential backoff while the stream stays up.
+- Disconnects, EOF, idle streams (no frame for 75s; the API sends a heartbeat every 20s) and network errors reconnect with exponential backoff plus jitter, from 1s up to 1m. A `401`/`403` is logged as a credential problem and retried only every 5 minutes.
+- Only a `404` (a RelayControl version without the stream) switches to low-frequency fallback. The bot then reconciles and re-probes every `INTENT_FALLBACK_INTERVAL` (default `1m`). Transient disconnects never resume fast polling.
+- `/readyz` reports RelayControl ready while the stream is connected (or the API answered `404` in fallback). Discord readiness reads local gateway state. Health checks make no extra API requests.
+- Events are parsed with `net/http` and a built-in `text/event-stream` parser. Lines and events are capped at 16 KiB, and unknown event types are ignored. Tokens and watch URLs are never logged.
+
+**Rollout:** deploy RelayControl with the event stream (dotnet_RelayControl#64) first, then this bot. Deploying the bot first is safe because it uses the 404 fallback. Afterwards, check Cloudflare Analytics or request logs: steady-state `/api/launch-intents/pending` traffic should fall from the ~86k/day baseline to a few requests per connection or event. `INTENT_POLL_INTERVAL` is no longer read and can be removed from deployments.
 
 ## Configuration
 
@@ -32,7 +46,7 @@ Copy `.env.example` and provide:
 - `RELAYCONTROL_BASE_URL`: RelayControl API base URL. HTTPS is required except for loopback development URLs.
 - `RELAYCONTROL_SERVICE_TOKEN`: credential configured for the restricted `launch-intents:bot` policy in RelayControl. Give it only to this service.
 
-The optional `SHARE_INTENT_TTL`, `WATCH_INTENT_TTL`, `INTENT_POLL_INTERVAL`, `HTTP_ADDR`, and `LOG_LEVEL` settings have validated defaults in `.env.example`. The API's public landing URL is configured as `RelayLaunch:PublicBaseUrl`; that endpoint opens the desktop protocol handler and offers the app download page. Set `RelayLaunch:ServiceToken` to the bot's `RELAYCONTROL_SERVICE_TOKEN`.
+The optional `SHARE_INTENT_TTL`, `WATCH_INTENT_TTL`, `INTENT_FALLBACK_INTERVAL` (15s–1h), `HTTP_ADDR`, and `LOG_LEVEL` settings have validated defaults in `.env.example`. The API's public landing URL is configured as `RelayLaunch:PublicBaseUrl`; that endpoint opens the desktop protocol handler and offers the app download page. Set `RelayLaunch:ServiceToken` to the bot's `RELAYCONTROL_SERVICE_TOKEN`.
 
 The Activity intent API attempt is capped at 1.5 seconds and shortened to reserve 500 milliseconds for the initial callback when gateway delivery consumed time. If that reserve is all that remains, the bot immediately defers for the desktop fallback. Initial Discord responses use the interaction creation timestamp plus 2.8 seconds, leaving margin inside Discord's 3-second deadline. An ambiguous network failure after sending callback 12 cannot safely be acknowledged again; retry the command in that case. No Activity success is reported without a valid unexpired intent. See [Activity hosting and setup](activity/README.md).
 

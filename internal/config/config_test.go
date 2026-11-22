@@ -17,7 +17,7 @@ func TestLoadUsesDocumentedDefaults(t *testing.T) {
 	if cfg.ShareIntentTTL.String() != "10m0s" || cfg.WatchIntentTTL.String() != "30m0s" {
 		t.Fatalf("unexpected intent defaults: share=%s watch=%s", cfg.ShareIntentTTL, cfg.WatchIntentTTL)
 	}
-	if cfg.IntentPollInterval.String() != "2s" || cfg.HTTPAddress != ":8080" {
+	if cfg.IntentFallbackInterval.String() != "1m0s" || cfg.HTTPAddress != ":8080" {
 		t.Fatalf("unexpected defaults: %#v", cfg)
 	}
 	if cfg.RelayControlBaseURL != "https://relay.example.com" {
@@ -62,4 +62,31 @@ func contains(text, part string) bool {
 		}
 	}
 	return false
+}
+
+func TestLoadValidatesFallbackIntervalAndIgnoresLegacyPollInterval(t *testing.T) {
+	base := map[string]string{
+		"DISCORD_TOKEN":              "discord-secret",
+		"DISCORD_APPLICATION_ID":     "123456789012345678",
+		"RELAYCONTROL_BASE_URL":      "https://relay.example.com",
+		"RELAYCONTROL_SERVICE_TOKEN": "relay-secret",
+		"INTENT_POLL_INTERVAL":       "2s",
+	}
+	load := func(fallback string) (Config, error) {
+		return Load(func(key string) string {
+			if key == "INTENT_FALLBACK_INTERVAL" {
+				return fallback
+			}
+			return base[key]
+		})
+	}
+	cfg, err := load("2m")
+	if err != nil || cfg.IntentFallbackInterval.String() != "2m0s" {
+		t.Fatalf("fallback interval = %s, err = %v", cfg.IntentFallbackInterval, err)
+	}
+	for _, invalid := range []string{"2s", "2h", "soon"} {
+		if _, err := load(invalid); err == nil {
+			t.Fatalf("INTENT_FALLBACK_INTERVAL=%q was accepted", invalid)
+		}
+	}
 }

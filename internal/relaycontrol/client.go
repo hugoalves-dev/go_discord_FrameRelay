@@ -101,13 +101,18 @@ type Client struct {
 	baseURL string
 	token   string
 	http    *http.Client
+	// stream shares the transport but has no overall timeout: the event stream is long-lived and
+	// liveness is enforced by streamIdleTimeout instead.
+	stream            *http.Client
+	streamIdleTimeout time.Duration
 }
 
 func NewClient(baseURL, token string, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 10 * time.Second}
 	}
-	return &Client{baseURL: strings.TrimRight(baseURL, "/"), token: token, http: httpClient}
+	stream := &http.Client{Transport: httpClient.Transport, CheckRedirect: httpClient.CheckRedirect, Jar: httpClient.Jar}
+	return &Client{baseURL: strings.TrimRight(baseURL, "/"), token: token, http: httpClient, stream: stream}
 }
 
 func (c *Client) CreateShare(ctx context.Context, request CreateShareRequest) (ShareIntent, error) {
