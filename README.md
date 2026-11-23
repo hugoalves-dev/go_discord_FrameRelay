@@ -4,9 +4,23 @@ This standalone Go service connects Discord slash commands to RelayControl launc
 
 ## Commands
 
-- `/framerelay share` responds privately with a one-click button that opens the FrameRelay desktop app. It works in server channels and personal chats. The owner starts capture and streaming in that app.
+- `/framerelay share` responds privately with a one-click button that opens the FrameRelay desktop app. It works in server channels, DMs, and Group DMs. The owner starts capture and streaming in that app.
 - `/framerelay watch code:<code>` creates a session/context-bound intent and responds with Discord `LAUNCH_ACTIVITY` (callback 12) before any defer. Run it in the voice channel's chat where the Activity will launch. If the Activity API is unavailable or Discord definitively rejects the launch callback, it defers and returns the existing private desktop watch button.
 
+### DMs and Group DMs
+
+FrameRelay works in a 1:1 DM or Group DM with other people, without a shared server:
+
+1. Enable **User Install** under **Installation** in the Discord Developer Portal, with the `applications.commands` scope for the user install type. Each person authorizes FrameRelay on their own account through the install link. Discord shows a user-installed command only to people who installed the app, so a participant needs it installed to run `/framerelay watch`. Anyone in the conversation can still select the announcement button.
+2. Register the command globally by leaving `DISCORD_GUILD_ID` unset. A development guild registration does not reach DMs.
+3. In the conversation, the host runs `/framerelay share`. The host privately gets the desktop launch button. The conversation gets a public follow-up with a **Watch in FrameRelay** button that contains no link or credential and pings no one.
+4. Once the host is sharing, each participant selects **Watch in FrameRelay**. RelayControl checks that the share is live and bound to that conversation, then sends that participant a private desktop watch link. Before the share is live, the button says to try again later. Participants who have the app can also run `/framerelay watch code:<host-code>`.
+
+The bot is usually not a member of private conversations, so it never posts the ready message there; the interaction follow-up replaces it. Discord Activities are guild-only in this bot, so DMs and Group DMs always use the FrameRelay desktop viewer, and the replies say so. Bot DMs follow the same flow.
+
+### Recovery
+
+The bot also recovers ready-but-unpublished shares after restart. It polls status with `watchTtlSeconds=0`, caches readiness without minting a watch capability, and uses a stable Discord message nonce so a retry after a successful post does not duplicate the announcement. The public announcement includes **Assistir no Discord**. Each click asks RelayControl for an Activity intent bound to that participant, guild, and channel. If the launch is unavailable, the bot replies privately with a fresh personal desktop watch link. The announcement contains no shared watch credential. `/framerelay watch` remains available with the host's code.
 The bot also recovers ready-but-unpublished shares after restart. It checks status with `watchTtlSeconds=0`, caches readiness without minting a watch capability, and uses a stable Discord message nonce so a retry after a successful post does not duplicate the announcement. The public announcement includes **Assistir no Discord**. Each click asks RelayControl for an Activity intent bound to that participant, guild, and channel. If the launch is unavailable, the bot replies privately with a fresh personal desktop watch link. The announcement contains no shared watch credential. `/framerelay watch` remains available with the host's code.
 
 ## Launch events
